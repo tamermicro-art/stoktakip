@@ -1,0 +1,3329 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import json
+import os
+import socket
+from datetime import datetime
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import sys
+import hashlib
+import requests
+
+class StokHandler(SimpleHTTPRequestHandler):
+    # Şifre kontrolü için değişken
+    SESSION_COOKIE = "stok_session"
+    LOGIN_PASSWORD = "tamer"  # Varsayılan şifre
+    logged_in = False
+    
+    # Telegram Ayarları
+    TELEGRAM_BOT_TOKEN = "8231404343:AAEaEGOjR6-hfBmQBKdvyKxpRZV8sEWJ7Ug"
+    TELEGRAM_CHAT_ID = "623297892"
+    
+    # HTML dosyasını sun
+    def do_GET(self):
+        # Şifre kontrolü
+        if not self.check_login() and self.path != '/login.html':
+            self.redirect_to_login()
+            return
+            
+        if self.path == '/':
+            self.path = '/stok.html'
+        elif self.path == '/api/urunler':
+            self.api_urunler()
+            return
+        elif self.path == '/api/musteriler':
+            self.api_musteriler()
+            return
+        elif self.path.startswith('/api/urun/'):
+            if '/hareketler' in self.path:
+                urun_kodu = self.path.split('/')[3]  # /api/urun/ABC123/hareketler
+                self.api_urun_hareketleri(urun_kodu)
+            else:
+                urun_kodu = self.path[10:]  # /api/urun/ kısmından sonrası
+                self.api_urun_detay(urun_kodu)
+            return
+        elif self.path == '/api/hareketler':
+            self.api_hareketler()
+            return
+        elif self.path == '/api/rapor':
+            self.api_rapor()
+            return
+        elif self.path == '/api/logout':
+            self.logout()
+            return
+        elif self.path == '/api/faturalar':
+            self.api_faturalar()
+            return
+        elif self.path.startswith('/api/fatura/'):
+            fatura_no = self.path[12:]  # /api/fatura/ kısmından sonrası
+            self.api_fatura_detay(fatura_no)
+            return
+        elif self.path == '/login.html':
+            # Login sayfasını göster
+            return super().do_GET()
+        elif self.path.startswith('/api/barkod_ara/'):
+            barkod = self.path[16:]  # /api/barkod_ara/ kısmından sonrası
+            self.api_barkod_ara(barkod)
+            return
+        
+        # Normal dosya sunumu
+        return super().do_GET()
+    
+    def do_POST(self):
+        # Login işlemi
+        if self.path == '/api/login':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            data = json.loads(post_data)
+            self.api_login(data)
+            return
+            
+        # Diğer POST işlemleri için şifre kontrolü
+        if not self.check_login():
+            self.send_response(401)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Oturum açılmamış!'}).encode('utf-8'))
+            return
+        
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        data = json.loads(post_data)
+        
+        if self.path == '/api/urun_ekle':
+            self.api_urun_ekle(data)
+        elif self.path == '/api/musteri_ekle':
+            self.api_musteri_ekle(data)
+        elif self.path == '/api/musteri_sil':
+            self.api_musteri_sil(data)
+        elif self.path == '/api/stok_giris':
+            self.api_stok_giris(data)
+        elif self.path == '/api/stok_cikis':
+            self.api_stok_cikis(data)
+        elif self.path == '/api/stok_iade':
+            self.api_stok_iade(data)
+        elif self.path == '/api/urun_sil':
+            self.api_urun_sil(data)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    # Şifre kontrolü metodları
+    def check_login(self):
+        """Cookie'den oturum kontrolü"""
+        if 'Cookie' in self.headers:
+            cookies = self.headers['Cookie']
+            if self.SESSION_COOKIE in cookies:
+                return True
+        return False
+    
+    def redirect_to_login(self):
+        """Login sayfasına yönlendir"""
+        self.send_response(302)
+        self.send_header('Location', '/login.html')
+        self.end_headers()
+    
+    def set_login_cookie(self):
+        """Başarılı girişte cookie set et"""
+        self.send_header('Set-Cookie', f'{self.SESSION_COOKIE}=logged_in; Path=/')
+    
+    def logout(self):
+        """Çıkış yap"""
+        self.send_response(302)
+        self.send_header('Set-Cookie', f'{self.SESSION_COOKIE}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT')
+        self.send_header('Location', '/login.html')
+        self.end_headers()
+    
+    # Sayı formatlama fonksiyonu
+    def format_currency(self, number):
+        """Binlik ayracı virgül, ondalık ayracı nokta olacak şekilde formatlar"""
+        try:
+            num = float(number)
+            # Ondalık kısmı 2 basamak, binlik ayracı virgül
+            return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except:
+            return "0,00"
+    
+    # Telegram bildirim gönder
+    def telegram_bildirim_gonder(self, baslik, mesaj):
+        """Telegram'a bildirim gönder"""
+        try:
+            url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMessage"
+            
+            tam_mesaj = f"🚀 *{baslik}*\n\n{mesaj}"
+            
+            payload = {
+                "chat_id": self.TELEGRAM_CHAT_ID,
+                "text": tam_mesaj,
+                "parse_mode": "Markdown"
+            }
+            
+            response = requests.post(url, json=payload, timeout=5)
+            
+            if response.status_code == 200:
+                print(f"✓ Telegram bildirimi gönderildi: {baslik}")
+            else:
+                print(f"✗ Telegram bildirimi gönderilemedi: {response.status_code}")
+                
+        except Exception as e:
+            print(f"⚠️ Telegram hatası: {str(e)}")
+    
+    # Login API
+    def api_login(self, data):
+        password = data.get('password', '')
+        
+        if password == self.LOGIN_PASSWORD:
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.set_login_cookie()
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': True, 'message': 'Giriş başarılı!'}).encode('utf-8'))
+        else:
+            self.send_response(401)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Hatalı şifre!'}).encode('utf-8'))
+    
+    # Veritabanı işlemleri
+    def veri_yukle(self):
+        if os.path.exists('stok_data.json'):
+            with open('stok_data.json', 'r', encoding='utf-8') as f:
+                veri = json.load(f)
+                # Eski versiyonlar için faturalar listesi ekleyelim
+                if 'faturalar' not in veri:
+                    veri['faturalar'] = []
+                return veri
+        return {'urunler': {}, 'musteriler': {}, 'hareketler': [], 'faturalar': []}
+    
+    def veri_kaydet(self, veri):
+        with open('stok_data.json', 'w', encoding='utf-8') as f:
+            json.dump(veri, f, ensure_ascii=False, indent=2)
+    
+    # API Endpoint'leri
+    def api_urunler(self):
+        veri = self.veri_yukle()
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(veri['urunler']).encode('utf-8'))
+    
+    def api_musteriler(self):
+        veri = self.veri_yukle()
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(veri['musteriler']).encode('utf-8'))
+    
+    def api_urun_detay(self, urun_kodu):
+        veri = self.veri_yukle()
+        if urun_kodu in veri['urunler']:
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(veri['urunler'][urun_kodu]).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def api_urun_hareketleri(self, urun_kodu):
+        veri = self.veri_yukle()
+        # Bu ürüne ait hareketleri filtrele
+        urun_hareketleri = [h for h in veri['hareketler'] if h['urun_kodu'] == urun_kodu]
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(urun_hareketleri[-50:]).encode('utf-8'))
+    
+    def api_hareketler(self):
+        veri = self.veri_yukle()
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        # Son 100 hareketi gönder
+        self.wfile.write(json.dumps(veri['hareketler'][-100:]).encode('utf-8'))
+    
+    def api_rapor(self):
+        veri = self.veri_yukle()
+        urunler = veri['urunler']
+        
+        toplam_urun = len(urunler)
+        toplam_stok = sum(u['stok'] for u in urunler.values())
+        toplam_deger = sum(u['stok'] * u.get('fiyat', 0) for u in urunler.values())
+        az_stoklu = {k: v for k, v in urunler.items() if v['stok'] < (v.get('kritik_stok', 10))}
+        
+        rapor = {
+            'toplam_urun': toplam_urun,
+            'toplam_stok': toplam_stok,
+            'toplam_deger': toplam_deger,
+            'az_stoklu': len(az_stoklu),
+            'toplam_musteri': len(veri['musteriler'])
+        }
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(rapor).encode('utf-8'))
+    
+    def api_faturalar(self):
+        veri = self.veri_yukle()
+        faturalar = veri.get('faturalar', [])
+        # Faturaları tersten sırala (en yeni en başta)
+        faturalar.sort(key=lambda x: x.get('tarih', ''), reverse=True)
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(faturalar).encode('utf-8'))
+    
+    def api_fatura_detay(self, fatura_no):
+        veri = self.veri_yukle()
+        faturalar = veri.get('faturalar', [])
+        for fatura in faturalar:
+            if fatura['fatura_no'] == fatura_no:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(fatura).encode('utf-8'))
+                return
+        self.send_response(404)
+        self.end_headers()
+    
+    def api_barkod_ara(self, barkod):
+        """Barkod numarasına göre ürün ara"""
+        veri = self.veri_yukle()
+        urunler = veri['urunler']
+        
+        # Barkod ile ürün ara
+        bulunan_urun = None
+        for urun_kodu, urun in urunler.items():
+            if urun.get('barkod', '') == barkod:
+                bulunan_urun = {
+                    'urun_kodu': urun_kodu,
+                    'urun': urun
+                }
+                break
+        
+        if bulunan_urun:
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'success': True, 
+                'urun_kodu': bulunan_urun['urun_kodu'],
+                'urun': bulunan_urun['urun']
+            }).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'success': False, 
+                'message': 'Bu barkod numarasına sahip ürün bulunamadı!'
+            }).encode('utf-8'))
+    
+    def api_urun_ekle(self, data):
+        veri = self.veri_yukle()
+        
+        urun_kodu = data['kod']
+        
+        if urun_kodu in veri['urunler']:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Bu ürün kodu zaten var!'}).encode('utf-8'))
+            return
+        
+        # Fiyat tipini düzelt (Replit hatası için)
+        try:
+            fiyat = float(data.get('fiyat', 0))
+        except ValueError:
+            fiyat = 0.0
+        
+        veri['urunler'][urun_kodu] = {
+            'ad': data['ad'],
+            'kategori': data.get('kategori', 'Diğer'),
+            'stok': int(data.get('stok', 0)),
+            'fiyat': fiyat,
+            'birim': data.get('birim', 'adet'),
+            'aciklama': data.get('aciklama', ''),
+            'barkod': data.get('barkod', ''),
+            'kritik_stok': int(data.get('kritik_stok', 10)),
+            'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Hareket kaydı
+        if int(data.get('stok', 0)) > 0:
+            hareket = {
+                'id': len(veri['hareketler']) + 1,
+                'urun_kodu': urun_kodu,
+                'tip': 'ILK_STOK',
+                'miktar': int(data.get('stok', 0)),
+                'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'aciklama': 'İlk stok',
+                'mevcut_stok': int(data.get('stok', 0))
+            }
+            veri['hareketler'].append(hareket)
+            
+            # Telegram bildirimi gönder
+            mesaj = f"""
+📦 *YENİ ÜRÜN EKLENDİ*
+
+*Ürün Kodu:* `{urun_kodu}`
+*Ürün Adı:* {data['ad']}
+*Kategori:* {data.get('kategori', 'Diğer')}
+*İlk Stok:* {int(data.get('stok', 0))} {data.get('birim', 'adet')}
+*Birim Fiyat:* {self.format_currency(fiyat)} TL
+*Toplam Değer:* {self.format_currency(int(data.get('stok', 0)) * fiyat)} TL
+*Birim:* {data.get('birim', 'adet')}
+*Barkod:* {data.get('barkod', 'Belirtilmemiş')}
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+            self.telegram_bildirim_gonder("YENİ ÜRÜN EKLENDİ", mesaj)
+        
+        self.veri_kaydet(veri)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'success': True, 'message': 'Ürün eklendi!'}).encode('utf-8'))
+    
+    def api_musteri_ekle(self, data):
+        veri = self.veri_yukle()
+        
+        musteri_kodu = data.get('kod', f"CUST{len(veri['musteriler']) + 1:03d}")
+        
+        if musteri_kodu in veri['musteriler']:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Bu müşteri kodu zaten var!'}).encode('utf-8'))
+            return
+        
+        veri['musteriler'][musteri_kodu] = {
+            'kod': musteri_kodu,
+            'ad': data['ad'],
+            'telefon': data.get('telefon', ''),
+            'adres': data.get('adres', ''),
+            'eposta': data.get('eposta', ''),
+            'vergi_no': data.get('vergi_no', ''),
+            'iskonto_orani': float(data.get('iskonto_orani', 0)),
+            'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Telegram bildirimi gönder
+        mesaj = f"""
+👤 *YENİ MÜŞTERİ EKLENDİ*
+
+*Müşteri Kodu:* `{musteri_kodu}`
+*Müşteri Adı:* {data['ad']}
+*Telefon:* {data.get('telefon', 'Belirtilmemiş')}
+*E-posta:* {data.get('eposta', 'Belirtilmemiş')}
+*İskonto Oranı:* {float(data.get('iskonto_orani', 0))}%
+*Vergi No:* {data.get('vergi_no', 'Belirtilmemiş')}
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+        self.telegram_bildirim_gonder("YENİ MÜŞTERİ EKLENDİ", mesaj)
+        
+        self.veri_kaydet(veri)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'success': True, 'message': 'Müşteri eklendi!'}).encode('utf-8'))
+    
+    def api_musteri_sil(self, data):
+        veri = self.veri_yukle()
+        musteri_kodu = data['musteri_kodu']
+        
+        if musteri_kodu in veri['musteriler']:
+            musteri_ad = veri['musteriler'][musteri_kodu]['ad']
+            del veri['musteriler'][musteri_kodu]
+            self.veri_kaydet(veri)
+            
+            # Telegram bildirimi gönder
+            mesaj = f"""
+🗑️ *MÜŞTERİ SİLİNDİ*
+
+*Müşteri Kodu:* `{musteri_kodu}`
+*Müşteri Adı:* {musteri_ad}
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+            self.telegram_bildirim_gonder("MÜŞTERİ SİLİNDİ", mesaj)
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': True, 'message': 'Müşteri silindi!'}).encode('utf-8'))
+        else:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Müşteri bulunamadı!'}).encode('utf-8'))
+    
+    def api_stok_giris(self, data):
+        veri = self.veri_yukle()
+        urun_kodu = data['urun_kodu']
+        miktar = int(data['miktar'])
+        
+        if urun_kodu not in veri['urunler']:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Ürün bulunamadı!'}).encode('utf-8'))
+            return
+        
+        urun = veri['urunler'][urun_kodu]
+        eski_stok = urun['stok']
+        urun['stok'] += miktar
+        
+        # Hareket kaydı
+        hareket = {
+            'id': len(veri['hareketler']) + 1,
+            'urun_kodu': urun_kodu,
+            'tip': 'GIRIS',
+            'miktar': miktar,
+            'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'aciklama': data.get('aciklama', ''),
+            'mevcut_stok': urun['stok']
+        }
+        veri['hareketler'].append(hareket)
+        
+        # Telegram bildirimi gönder
+        mesaj = f"""
+📥 *STOK GİRİŞİ YAPILDI*
+
+*Ürün Kodu:* `{urun_kodu}`
+*Ürün Adı:* {urun['ad']}
+*Eski Stok:* {eski_stok} {urun['birim']}
+*Giriş Miktarı:* +{miktar} {urun['birim']}
+*Yeni Stok:* {urun['stok']} {urun['birim']}
+*Birim Fiyat:* {self.format_currency(urun['fiyat'])} TL
+*Toplam Değer:* {self.format_currency(urun['stok'] * urun['fiyat'])} TL
+*Açıklama:* {data.get('aciklama', 'Belirtilmemiş')}
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+        self.telegram_bildirim_gonder("STOK GİRİŞİ", mesaj)
+        
+        self.veri_kaydet(veri)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'success': True, 'message': f'{miktar} adet stok girişi yapıldı!'}).encode('utf-8'))
+    
+    def api_stok_cikis(self, data):
+        veri = self.veri_yukle()
+        urun_kodu = data['urun_kodu']
+        miktar = int(data['miktar'])
+        musteri_kodu = data.get('musteri_kodu', '')
+        iskonto_orani = float(data.get('iskonto_orani', 0))
+        kdv_orani = float(data.get('kdv_orani', 18))  # Varsayılan KDV %18
+        saha = data.get('saha', '')
+        fiyati_gizle = data.get('fiyati_gizle', False)
+        
+        # Debug için
+        print(f"DEBUG: fiyati_gizle değeri: {fiyati_gizle}, tipi: {type(fiyati_gizle)}")
+        
+        if urun_kodu not in veri['urunler']:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Ürün bulunamadı!'}).encode('utf-8'))
+            return
+        
+        urun = veri['urunler'][urun_kodu]
+        eski_stok = urun['stok']
+        
+        if urun['stok'] < miktar:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': f'Yetersiz stok! Mevcut: {urun["stok"]}'}).encode('utf-8'))
+            return
+        
+        urun['stok'] -= miktar
+        
+        # Müşteri bilgisi
+        musteri_bilgisi = {}
+        if musteri_kodu and musteri_kodu in veri['musteriler']:
+            musteri_bilgisi = veri['musteriler'][musteri_kodu]
+            # Müşteriye özel iskonto varsa kullan
+            if musteri_bilgisi.get('iskonto_orani', 0) > iskonto_orani:
+                iskonto_orani = musteri_bilgisi.get('iskonto_orani', 0)
+        
+        # Fatura hesaplamaları
+        fatura_no = f"FTR{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        birim_fiyat = urun.get('fiyat', 0)
+        toplam_tutar = miktar * birim_fiyat
+        iskonto_tutari = toplam_tutar * (iskonto_orani / 100)
+        iskontolu_tutar = toplam_tutar - iskonto_tutari
+        kdv_tutari = iskontolu_tutar * (kdv_orani / 100)
+        genel_toplam = iskontolu_tutar + kdv_tutari
+        
+        # Faturada kullanılacak müşteri adı
+        fatura_musteri_adi = musteri_bilgisi.get('ad', '') if musteri_bilgisi else 'Genel Müşteri'
+        if not fatura_musteri_adi and musteri_kodu:
+            fatura_musteri_adi = f"Müşteri {musteri_kodu}"
+        
+        fatura = {
+            'fatura_no': fatura_no,
+            'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'musteri_kodu': musteri_kodu,
+            'musteri_adi': fatura_musteri_adi,
+            'urun_kodu': urun_kodu,
+            'urun_adi': urun['ad'],
+            'miktar': miktar,
+            'birim_fiyat': birim_fiyat,
+            'toplam_tutar': toplam_tutar,
+            'iskonto_orani': iskonto_orani,
+            'iskonto_tutari': iskonto_tutari,
+            'kdv_orani': kdv_orani,
+            'kdv_tutari': kdv_tutari,
+            'genel_toplam': genel_toplam,
+            'aciklama': data.get('aciklama', ''),
+            'saha': saha,
+            'fiyati_gizle': bool(fiyati_gizle)  # Boolean'a çevir
+        }
+        
+        # Faturayı kaydet
+        veri['faturalar'].append(fatura)
+        
+        # Hareket kaydı
+        hareket = {
+            'id': len(veri['hareketler']) + 1,
+            'urun_kodu': urun_kodu,
+            'tip': 'CIKIS',
+            'miktar': miktar,
+            'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'aciklama': data.get('aciklama', ''),
+            'musteri_kodu': musteri_kodu,
+            'iskonto_orani': iskonto_orani,
+            'kdv_orani': kdv_orani,
+            'mevcut_stok': urun['stok'],
+            'saha': saha,
+            'fatura_no': fatura_no
+        }
+        veri['hareketler'].append(hareket)
+        
+        # Telegram bildirimi gönder
+        mesaj = f"""
+📤 *STOK ÇIKIŞI YAPILDI*
+
+*Fatura No:* `{fatura_no}`
+*Ürün Kodu:* `{urun_kodu}`
+*Ürün Adı:* {urun['ad']}
+*Müşteri:* {fatura_musteri_adi}
+*Müşteri Kodu:* {musteri_kodu if musteri_kodu else 'Belirtilmemiş'}
+*Saha:* {saha if saha else 'Belirtilmemiş'}
+*Eski Stok:* {eski_stok} {urun['birim']}
+*Çıkış Miktarı:* -{miktar} {urun['birim']}
+*Yeni Stok:* {urun['stok']} {urun['birim']}
+*Birim Fiyat:* {self.format_currency(birim_fiyat)} TL
+*Toplam Tutar:* {self.format_currency(toplam_tutar)} TL
+*İskonto (%{iskonto_orani}):* {self.format_currency(iskonto_tutari)} TL
+*KDV (%{kdv_orani}):* {self.format_currency(kdv_tutari)} TL
+*Genel Toplam:* {self.format_currency(genel_toplam)} TL
+*Fiyat Gizli mi?:* {'Evet' if bool(fiyati_gizle) else 'Hayır'}
+*Açıklama:* {data.get('aciklama', 'Belirtilmemiş')}
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+        self.telegram_bildirim_gonder("STOK ÇIKIŞI", mesaj)
+        
+        self.veri_kaydet(veri)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            'success': True, 
+            'message': 'Stok çıkışı yapıldı!', 
+            'fatura': fatura
+        }).encode('utf-8'))
+    
+    def api_stok_iade(self, data):
+        veri = self.veri_yukle()
+        urun_kodu = data['urun_kodu']
+        miktar = int(data['miktar'])
+        
+        if urun_kodu not in veri['urunler']:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Ürün bulunamadı!'}).encode('utf-8'))
+            return
+        
+        urun = veri['urunler'][urun_kodu]
+        eski_stok = urun['stok']
+        urun['stok'] += miktar
+        
+        # Hareket kaydı
+        hareket = {
+            'id': len(veri['hareketler']) + 1,
+            'urun_kodu': urun_kodu,
+            'tip': 'IADE',
+            'miktar': miktar,
+            'tarih': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'aciklama': data.get('aciklama', ''),
+            'mevcut_stok': urun['stok']
+        }
+        veri['hareketler'].append(hareket)
+        
+        # Telegram bildirimi gönder
+        mesaj = f"""
+🔄 *STOK İADESİ ALINDI*
+
+*Ürün Kodu:* `{urun_kodu}`
+*Ürün Adı:* {urun['ad']}
+*Eski Stok:* {eski_stok} {urun['birim']}
+*İade Miktarı:* +{miktar} {urun['birim']}
+*Yeni Stok:* {urun['stok']} {urun['birim']}
+*Birim Fiyat:* {self.format_currency(urun['fiyat'])} TL
+*Toplam Değer:* {self.format_currency(urun['stok'] * urun['fiyat'])} TL
+*Açıklama:* {data.get('aciklama', 'Belirtilmemiş')}
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+        self.telegram_bildirim_gonder("STOK İADESİ", mesaj)
+        
+        self.veri_kaydet(veri)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'success': True, 'message': f'{miktar} adet iade alındı!'}).encode('utf-8'))
+    
+    def api_urun_sil(self, data):
+        veri = self.veri_yukle()
+        urun_kodu = data['urun_kodu']
+        
+        if urun_kodu in veri['urunler']:
+            urun_ad = veri['urunler'][urun_kodu]['ad']
+            urun_stok = veri['urunler'][urun_kodu]['stok']
+            urun_fiyat = veri['urunler'][urun_kodu]['fiyat']
+            
+            del veri['urunler'][urun_kodu]
+            self.veri_kaydet(veri)
+            
+            # Telegram bildirimi gönder
+            mesaj = f"""
+🗑️ *ÜRÜN SİLİNDİ*
+
+*Ürün Kodu:* `{urun_kodu}`
+*Ürün Adı:* {urun_ad}
+*Silinen Stok:* {urun_stok} adet
+*Birim Fiyat:* {self.format_currency(urun_fiyat)} TL
+*Toplam Değer:* {self.format_currency(urun_stok * urun_fiyat)} TL
+*Tarih:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+"""
+            self.telegram_bildirim_gonder("ÜRÜN SİLİNDİ", mesaj)
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': True, 'message': 'Ürün silindi!'}).encode('utf-8'))
+        else:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': False, 'message': 'Ürün bulunamadı!'}).encode('utf-8'))
+
+def get_ip_address():
+    """Bilgisayarın IP adresini bul"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
+def create_html_files():
+    """Gerekli HTML dosyalarını oluştur"""
+    
+    # Login HTML - footer kısmını kaldırdık
+    login_html = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tamersoft - Giriş</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .login-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+            width: 100%;
+            max-width: 400px;
+            padding: 40px;
+        }
+        
+        .logo {
+            text-align: center;
+            margin-bottom: 30px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        
+        .logo-gears {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            position: relative;
+            height: 60px;
+        }
+        
+        .gear-large {
+            font-size: 60px;
+            color: #4f46e5;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .gear-small {
+            font-size: 40px;
+            color: #7c3aed;
+            position: absolute;
+            right: -5px;
+            bottom: -5px;
+            z-index: 2;
+        }
+        
+        .logo-text {
+            font-size: 2.5em;
+            font-weight: bold;
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 10px;
+        }
+        
+        .logo-subtitle {
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+        
+        .input-group input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: #4f46e5;
+        }
+        
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .error-message {
+            background: #ffebee;
+            color: #c62828;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">
+            <div class="logo-gears">
+                <div class="gear-large">⚙️</div>
+                <div class="gear-small">⚙️</div>
+            </div>
+            <div class="logo-text">tamersoft</div>
+            <p class="logo-subtitle">Stok Takip Sistemi</p>
+        </div>
+        
+        <div class="error-message" id="errorMessage"></div>
+        
+        <div class="input-group">
+            <label for="password">Şifre</label>
+            <input type="password" id="password" placeholder="Şifrenizi giriniz">
+        </div>
+        
+        <button onclick="login()">Giriş Yap</button>
+    </div>
+    
+    <script>
+        function login() {
+            const password = document.getElementById('password').value;
+            const errorMessage = document.getElementById('errorMessage');
+            
+            if (!password) {
+                errorMessage.textContent = 'Lütfen şifre giriniz!';
+                errorMessage.style.display = 'block';
+                return;
+            }
+            
+            fetch('/api/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ password: password })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    window.location.href = '/';
+                } else {
+                    errorMessage.textContent = data.message;
+                    errorMessage.style.display = 'block';
+                }
+            })
+            .catch(error => {
+                errorMessage.textContent = 'Bir hata oluştu!';
+                errorMessage.style.display = 'block';
+            });
+        }
+        
+        // Enter tuşu ile giriş
+        document.getElementById('password').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                login();
+            }
+        });
+    </script>
+</body>
+</html>"""
+    
+    # Ana HTML (stok.html) - Faturalar sekmesi eklendi
+    stok_html = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tamersoft - Stok Takip Sistemi</title>
+    <style>
+        :root {
+            --primary-color: #4f46e5;
+            --secondary-color: #7c3aed;
+            --success-color: #10b981;
+            --danger-color: #ef4444;
+            --warning-color: #f59e0b;
+            --info-color: #3b82f6;
+            --dark-color: #1f2937;
+            --light-color: #f9fafb;
+            --border-color: #e5e7eb;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background-color: #f5f7fb;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 25px rgba(79, 70, 229, 0.2);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: relative;
+        }
+        
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .logo-gears {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            height: 50px;
+            width: 70px;
+        }
+        
+        .gear-large {
+            font-size: 50px;
+            color: white;
+            position: relative;
+            z-index: 1;
+            filter: drop-shadow(2px 2px 4px rgba(0,0,0,0.2));
+        }
+        
+        .gear-small {
+            font-size: 35px;
+            color: rgba(255, 255, 255, 0.9);
+            position: absolute;
+            right: -5px;
+            bottom: -5px;
+            z-index: 2;
+            filter: drop-shadow(2px 2px 4px rgba(0,0,0,0.2));
+        }
+        
+        .logo-text {
+            font-size: 2.2em;
+            font-weight: bold;
+            color: white;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .logo-subtitle {
+            background: rgba(255,255,255,0.9);
+            color: var(--primary-color);
+            padding: 5px 15px;
+            border-radius: 50px;
+            font-size: 0.8em;
+            margin-left: 15px;
+            font-weight: 600;
+        }
+        
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .btn-logout {
+            background: rgba(255,255,255,0.2);
+            border: 2px solid white;
+            color: white;
+            padding: 8px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        .btn-logout:hover {
+            background: white;
+            color: var(--primary-color);
+        }
+        
+        /* Navigation */
+        .nav-tabs {
+            display: flex;
+            background: white;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+            overflow: hidden;
+        }
+        
+        .nav-tab {
+            flex: 1;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            font-weight: 600;
+            color: #666;
+            transition: all 0.3s;
+        }
+        
+        .nav-tab:hover {
+            background-color: #f8fafc;
+            color: var(--primary-color);
+        }
+        
+        .nav-tab.active {
+            color: var(--primary-color);
+            border-bottom-color: var(--primary-color);
+            background-color: #f8fafc;
+        }
+        
+        /* Content Panels */
+        .content-panel {
+            display: none;
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.05);
+        }
+        
+        .content-panel.active {
+            display: block;
+            animation: fadeIn 0.5s;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Form Styles */
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #555;
+        }
+        
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: var(--primary-color);
+        }
+        
+        .form-row {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .form-row .form-group {
+            flex: 1;
+        }
+        
+        /* Button Styles */
+        .btn {
+            padding: 12px 25px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(79, 70, 229, 0.2);
+        }
+        
+        .btn-success {
+            background-color: var(--success-color);
+            color: white;
+        }
+        
+        .btn-danger {
+            background-color: var(--danger-color);
+            color: white;
+        }
+        
+        .btn-warning {
+            background-color: var(--warning-color);
+            color: white;
+        }
+        
+        .btn-sm {
+            padding: 8px 15px;
+            font-size: 14px;
+        }
+        
+        /* Table Styles */
+        .table-container {
+            overflow-x: auto;
+            margin-top: 20px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        
+        th {
+            background-color: #f8fafc;
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: var(--dark-color);
+            border-bottom: 2px solid var(--border-color);
+        }
+        
+        td {
+            padding: 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        tr:hover {
+            background-color: #f9fafb;
+        }
+        
+        /* Ürün Listesi Tablosu */
+        .urun-row {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .urun-row:hover {
+            background-color: #f0f9ff;
+        }
+        
+        /* Status Badges */
+        .badge {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge-success {
+            background-color: #d1fae5;
+            color: var(--success-color);
+        }
+        
+        .badge-warning {
+            background-color: #fef3c7;
+            color: var(--warning-color);
+        }
+        
+        .badge-danger {
+            background-color: #fee2e2;
+            color: var(--danger-color);
+        }
+        
+        .badge-info {
+            background-color: #dbeafe;
+            color: var(--info-color);
+        }
+        
+        /* Alert Messages */
+        .alert {
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .alert-success {
+            background-color: #d1fae5;
+            color: var(--success-color);
+            border: 1px solid #a7f3d0;
+        }
+        
+        .alert-danger {
+            background-color: #fee2e2;
+            color: var(--danger-color);
+            border: 1px solid #fecaca;
+        }
+        
+        /* Dashboard Cards */
+        .dashboard-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+            transition: transform 0.3s;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .card-icon {
+            width: 60px;
+            height: 60px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            margin-bottom: 15px;
+        }
+        
+        .card:nth-child(1) .card-icon {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+        }
+        
+        .card:nth-child(2) .card-icon {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+        }
+        
+        .card:nth-child(3) .card-icon {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: white;
+        }
+        
+        .card:nth-child(4) .card-icon {
+            background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+            color: white;
+        }
+        
+        .card h3 {
+            font-size: 1.5em;
+            margin-bottom: 10px;
+            color: var(--dark-color);
+        }
+        
+        .card p {
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .modal-content {
+            background: white;
+            border-radius: 15px;
+            width: 90%;
+            max-width: 600px;
+            max-height: 90vh;
+            overflow-y: auto;
+            animation: modalSlide 0.3s;
+        }
+        
+        @keyframes modalSlide {
+            from { transform: translateY(-50px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        .modal-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-body {
+            padding: 20px;
+        }
+        
+        .close-modal {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #666;
+        }
+        
+        /* Ürün Detay */
+        .urun-detay-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid var(--border-color);
+        }
+        
+        .urun-detay-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .info-card {
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 4px solid var(--primary-color);
+        }
+        
+        .info-card h4 {
+            margin-bottom: 10px;
+            color: var(--dark-color);
+        }
+        
+        .info-card p {
+            font-size: 1.2em;
+            font-weight: bold;
+            color: var(--primary-color);
+        }
+        
+        /* Hızlı İşlem Butonları */
+        .hizli-islemler {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        
+        /* Barkod Arama Kutusu */
+        .barkod-arama {
+            background: #f8fafc;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+            border: 2px solid var(--border-color);
+        }
+        
+        .barkod-arama h3 {
+            margin-bottom: 15px;
+            color: var(--dark-color);
+        }
+        
+        .barkod-arama-input {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .barkod-arama-input input {
+            flex: 1;
+            padding: 12px 15px;
+            border: 2px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        
+        .barkod-arama-input input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .form-row {
+                flex-direction: column;
+                gap: 0;
+            }
+            
+            .nav-tabs {
+                flex-wrap: wrap;
+            }
+            
+            .nav-tab {
+                flex: 1 0 50%;
+                padding: 15px;
+            }
+            
+            .header {
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+            
+            .logo {
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .logo-gears {
+                height: 40px;
+                width: 60px;
+            }
+            
+            .gear-large {
+                font-size: 40px;
+            }
+            
+            .gear-small {
+                font-size: 28px;
+            }
+            
+            .logo-text {
+                font-size: 1.8em;
+            }
+            
+            .dashboard-cards {
+                grid-template-columns: 1fr;
+            }
+            
+            .hizli-islemler {
+                flex-direction: column;
+            }
+            
+            .hizli-islemler button {
+                width: 100%;
+            }
+            
+            .barkod-arama-input {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo-container">
+                <div class="logo">
+                    <div class="logo-gears">
+                        <div class="gear-large">⚙️</div>
+                        <div class="gear-small">⚙️</div>
+                    </div>
+                    <div class="logo-text">tamersoft</div>
+                    <div class="logo-subtitle">Stok Takip Sistemi</div>
+                </div>
+            </div>
+            <div class="user-info">
+                <button class="btn-logout" onclick="logout()">Çıkış Yap</button>
+            </div>
+        </div>
+        
+        <!-- Navigation Tabs -->
+        <div class="nav-tabs">
+            <div class="nav-tab active" onclick="showPanel('dashboard')">Dashboard</div>
+            <div class="nav-tab" onclick="showPanel('urunler')">Ürünler</div>
+            <div class="nav-tab" onclick="showPanel('musteriler')">Müşteriler</div>
+            <div class="nav-tab" onclick="showPanel('stok-islemleri')">Stok İşlemleri</div>
+            <div class="nav-tab" onclick="showPanel('faturalar')">Faturalar</div>
+            <div class="nav-tab" onclick="showPanel('hareketler')">Hareketler</div>
+            <div class="nav-tab" onclick="showPanel('raporlar')">Raporlar</div>
+        </div>
+        
+        <!-- Alert Messages -->
+        <div class="alert alert-success" id="successAlert"></div>
+        <div class="alert alert-danger" id="errorAlert"></div>
+        
+        <!-- Dashboard Panel -->
+        <div class="content-panel active" id="dashboard">
+            <h2>Dashboard</h2>
+            <p class="subtitle">Sistem istatistikleri ve genel bakış</p>
+            
+            <div class="dashboard-cards">
+                <div class="card">
+                    <div class="card-icon">📦</div>
+                    <h3 id="toplamUrun">0</h3>
+                    <p>Toplam Ürün</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon">📊</div>
+                    <h3 id="toplamStok">0</h3>
+                    <p>Toplam Stok</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon">💰</div>
+                    <h3 id="toplamDeger">0 TL</h3>
+                    <p>Toplam Değer</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon">👥</div>
+                    <h3 id="toplamMusteri">0</h3>
+                    <p>Toplam Müşteri</p>
+                </div>
+            </div>
+            
+            <div style="margin-top: 30px;">
+                <h3>Son Hareketler</h3>
+                <div class="table-container">
+                    <table id="sonHareketlerTable">
+                        <thead>
+                            <tr>
+                                <th>Tarih</th>
+                                <th>Ürün Kodu</th>
+                                <th>İşlem</th>
+                                <th>Miktar</th>
+                                <th>Mevcut Stok</th>
+                                <th>Saha</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Son hareketler buraya eklenecek -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Ürünler Panel -->
+        <div class="content-panel" id="urunler">
+            <h2>Ürün Yönetimi</h2>
+            <p class="subtitle">Ürün ekle, düzenle ve sil</p>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Ürün Kodu *</label>
+                    <input type="text" id="urunKodu" placeholder="Ürün kodunu girin">
+                </div>
+                <div class="form-group">
+                    <label>Ürün Adı *</label>
+                    <input type="text" id="urunAdi" placeholder="Ürün adını girin">
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Kategori</label>
+                    <input type="text" id="urunKategori" placeholder="Kategori girin">
+                </div>
+                <div class="form-group">
+                    <label>Birim</label>
+                    <select id="urunBirim">
+                        <option value="adet">Adet</option>
+                        <option value="metre">Metre</option>
+                        <option value="kg">Kilogram</option>
+                        <option value="lt">Litre</option>
+                        <option value="paket">Paket</option>
+                        <option value="kutu">Kutu</option>
+                        <option value="metrekare">Metrekare</option>
+                        <option value="cm">Santimetre</option>
+                        <option value="mm">Milimetre</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Stok Miktarı</label>
+                    <input type="number" id="urunStok" value="0">
+                </div>
+                <div class="form-group">
+                    <label>Fiyat (TL)</label>
+                    <input type="number" step="0.01" id="urunFiyat" value="0">
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Kritik Stok Seviyesi</label>
+                    <input type="number" id="urunKritikStok" value="10">
+                </div>
+                <div class="form-group">
+                    <label>Barkod</label>
+                    <input type="text" id="urunBarkod" placeholder="Barkod numarası">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Açıklama</label>
+                <textarea id="urunAciklama" rows="3" placeholder="Ürün açıklaması"></textarea>
+            </div>
+            
+            <button class="btn btn-primary" onclick="urunEkle()">Ürün Ekle</button>
+            
+            <div style="margin-top: 30px;">
+                <h3>Mevcut Ürünler</h3>
+                <div class="table-container">
+                    <table id="urunlerTable">
+                        <thead>
+                            <tr>
+                                <th>Kod</th>
+                                <th>Ad</th>
+                                <th>Kategori</th>
+                                <th>Stok</th>
+                                <th>Fiyat (TL)</th>
+                                <th>Birim</th>
+                                <th>Barkod</th>
+                                <th>İşlemler</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Ürünler buraya eklenecek -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Müşteriler Panel -->
+        <div class="content-panel" id="musteriler">
+            <h2>Müşteri Yönetimi</h2>
+            <p class="subtitle">Müşteri ekle, düzenle ve sil</p>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Müşteri Kodu (Opsiyonel)</label>
+                    <input type="text" id="musteriKodu" placeholder="Otomatik üretilecek">
+                </div>
+                <div class="form-group">
+                    <label>Müşteri Adı *</label>
+                    <input type="text" id="musteriAdi" placeholder="Müşteri adını girin">
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Telefon</label>
+                    <input type="tel" id="musteriTelefon" placeholder="Telefon numarası">
+                </div>
+                <div class="form-group">
+                    <label>E-posta</label>
+                    <input type="email" id="musteriEposta" placeholder="E-posta adresi">
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Vergi No</label>
+                    <input type="text" id="musteriVergiNo" placeholder="Vergi numarası">
+                </div>
+                <div class="form-group">
+                    <label>İskonto Oranı (%)</label>
+                    <input type="number" step="0.1" id="musteriIskonto" value="0" min="0" max="100">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Adres</label>
+                <textarea id="musteriAdres" rows="2" placeholder="Müşteri adresi"></textarea>
+            </div>
+            
+            <button class="btn btn-primary" onclick="musteriEkle()">Müşteri Ekle</button>
+            
+            <div style="margin-top: 30px;">
+                <h3>Mevcut Müşteriler</h3>
+                <div class="table-container">
+                    <table id="musterilerTable">
+                        <thead>
+                            <tr>
+                                <th>Kod</th>
+                                <th>Ad</th>
+                                <th>Telefon</th>
+                                <th>E-posta</th>
+                                <th>İskonto</th>
+                                <th>İşlemler</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Müşteriler buraya eklenecek -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Stok İşlemleri Panel -->
+        <div class="content-panel" id="stok-islemleri">
+            <div id="stokAnaPanel">
+                <h2>Stok İşlemleri</h2>
+                <p class="subtitle">Stok girişi, çıkışı ve iade işlemleri</p>
+                
+                <div style="display: flex; gap: 20px; margin-bottom: 30px;">
+                    <button class="btn btn-success" onclick="showStokModal('giris')">Stok Girişi</button>
+                    <button class="btn btn-danger" onclick="showStokModal('cikis')">Stok Çıkışı</button>
+                    <button class="btn btn-warning" onclick="showStokModal('iade')">Stok İadesi</button>
+                </div>
+                
+                <!-- Barkod Arama Kutusu -->
+                <div class="barkod-arama">
+                    <h3>Barkod ile Hızlı Arama</h3>
+                    <p class="subtitle">Barkod okuyucudan okutun veya barkod numarasını girin</p>
+                    <div class="barkod-arama-input">
+                        <input type="text" id="barkodArama" placeholder="Barkod numarasını girin veya okuyun" autocomplete="off">
+                        <button class="btn btn-primary" onclick="barkodAra()">Ara</button>
+                    </div>
+                    <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                        📍 Barkod okuyucudan okuttuğunuzda otomatik arama yapacaktır
+                    </p>
+                </div>
+                
+                <h3>Mevcut Stoklar</h3>
+                <p class="subtitle">Tıklayarak ürün detayını görüntüleyin</p>
+                
+                <div class="table-container">
+                    <table id="mevcutStoklarTable">
+                        <thead>
+                            <tr>
+                                <th>Kod</th>
+                                <th>Ad</th>
+                                <th>Kategori</th>
+                                <th>Stok Durumu</th>
+                                <th>Miktar</th>
+                                <th>Fiyat (TL)</th>
+                                <th>Değer (TL)</th>
+                                <th>Barkod</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Stoklar buraya eklenecek -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Ürün Detay Panel (Başlangıçta gizli) -->
+            <div id="urunDetayPanel" style="display: none;">
+                <div class="urun-detay-header">
+                    <div>
+                        <h2 id="detayUrunAdi"></h2>
+                        <p id="detayUrunKodu" class="subtitle"></p>
+                    </div>
+                    <button class="btn" onclick="geriDon()">← Geri Dön</button>
+                </div>
+                
+                <div class="urun-detay-info">
+                    <div class="info-card">
+                        <h4>Mevcut Stok</h4>
+                        <p id="detayMevcutStok">0</p>
+                    </div>
+                    <div class="info-card">
+                        <h4>Birim Fiyat</h4>
+                        <p id="detayBirimFiyat">0 TL</p>
+                    </div>
+                    <div class="info-card">
+                        <h4>Stok Değeri</h4>
+                        <p id="detayStokDegeri">0 TL</p>
+                    </div>
+                    <div class="info-card">
+                        <h4>Kritik Stok</h4>
+                        <p id="detayKritikStok">10</p>
+                    </div>
+                </div>
+                
+                <div class="hizli-islemler">
+                    <button class="btn btn-success" onclick="urunDetayIslem('giris')">Stok Girişi Yap</button>
+                    <button class="btn btn-danger" onclick="urunDetayIslem('cikis')">Stok Çıkışı Yap</button>
+                    <button class="btn btn-warning" onclick="urunDetayIslem('iade')">İade Al</button>
+                </div>
+                
+                <h3>Ürüne Ait Son Hareketler</h3>
+                <div class="table-container">
+                    <table id="urunDetayHareketlerTable">
+                        <thead>
+                            <tr>
+                                <th>Tarih</th>
+                                <th>İşlem Tipi</th>
+                                <th>Miktar</th>
+                                <th>Mevcut Stok</th>
+                                <th>Açıklama</th>
+                                <th>Müşteri</th>
+                                <th>Saha</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Ürün hareketleri buraya eklenecek -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Faturalar Panel -->
+        <div class="content-panel" id="faturalar">
+            <h2>Faturalar</h2>
+            <p class="subtitle">Kesilen faturaların listesi</p>
+            
+            <div class="table-container">
+                <table id="faturalarTable">
+                    <thead>
+                        <tr>
+                            <th>Fatura No</th>
+                            <th>Tarih</th>
+                            <th>Müşteri</th>
+                            <th>Ürün</th>
+                            <th>Miktar</th>
+                            <th>Toplam Tutar</th>
+                            <th>Saha</th>
+                            <th>Fiyat Gizli</th>
+                            <th>İşlem</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Faturalar buraya eklenecek -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Hareketler Panel -->
+        <div class="content-panel" id="hareketler">
+            <h2>Stok Hareketleri</h2>
+            <p class="subtitle">Tüm stok hareketlerinin listesi</p>
+            
+            <div class="table-container">
+                <table id="hareketlerTable">
+                    <thead>
+                        <tr>
+                            <th>Tarih</th>
+                            <th>İşlem No</th>
+                            <th>Ürün Kodu</th>
+                            <th>İşlem Tipi</th>
+                            <th>Miktar</th>
+                            <th>Mevcut Stok</th>
+                            <th>Açıklama</th>
+                            <th>Müşteri</th>
+                            <th>Saha</th>
+                            <th>Fatura No</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Hareketler buraya eklenecek -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Raporlar Panel -->
+        <div class="content-panel" id="raporlar">
+            <h2>Raporlar</h2>
+            <p class="subtitle">Sistem raporları ve analizler</p>
+            
+            <div class="dashboard-cards">
+                <div class="card">
+                    <div class="card-icon">⚠️</div>
+                    <h3 id="azStokluUrun">0</h3>
+                    <p>Az Stoklu Ürün</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon">📈</div>
+                    <h3 id="toplamCikis">0</h3>
+                    <p>Toplam Çıkış</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon">📉</div>
+                    <h3 id="toplamGiris">0</h3>
+                    <p>Toplam Giriş</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon">🔄</div>
+                    <h3 id="toplamIade">0</h3>
+                    <p>Toplam İade</p>
+                </div>
+            </div>
+            
+            <div style="margin-top: 30px;">
+                <h3>Fatura Oluştur</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Ürün Seç</label>
+                        <select id="faturaUrun">
+                            <!-- Ürünler buraya eklenecek -->
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Müşteri Seç</label>
+                        <select id="faturaMusteri">
+                            <!-- Müşteriler buraya eklenecek -->
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Miktar</label>
+                        <input type="number" id="faturaMiktar" value="1">
+                    </div>
+                </div>
+                
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>İskonto Oranı (%)</label>
+                        <input type="number" id="faturaIskonto" value="0" min="0" max="100" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label>KDV Oranı (%)</label>
+                        <input type="number" id="faturaKdv" value="18" min="0" max="100" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label>Saha</label>
+                        <input type="text" id="faturaSaha" placeholder="Stok çıkış yapılacak saha">
+                    </div>
+                </div>
+                
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="faturaFiyatiGizle"> Fiyatı Gizle
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>Açıklama</label>
+                        <input type="text" id="faturaAciklama" placeholder="Fatura açıklaması">
+                    </div>
+                </div>
+                
+                <button class="btn btn-primary" onclick="faturaOlustur()">Fatura Oluştur</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Stok İşlem Modal -->
+    <div class="modal" id="stokModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalTitle">Stok İşlemi</h3>
+                <button class="close-modal" onclick="closeModal()">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Ürün Kodu *</label>
+                    <select id="modalUrunKodu">
+                        <!-- Ürünler buraya eklenecek -->
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Miktar *</label>
+                    <input type="number" id="modalMiktar" value="1">
+                </div>
+                
+                <!-- İskonto Alanı (Sadece çıkış işleminde gösterilecek) -->
+                <div class="form-group" id="iskontoGroup" style="display: none;">
+                    <label>İskonto Oranı (%)</label>
+                    <input type="number" id="modalIskonto" value="0" min="0" max="100" step="0.1">
+                </div>
+                
+                <!-- KDV Alanı (Sadece çıkış işleminde gösterilecek) -->
+                <div class="form-group" id="kdvGroup" style="display: none;">
+                    <label>KDV Oranı (%)</label>
+                    <input type="number" id="modalKdv" value="18" min="0" max="100" step="0.1">
+                </div>
+                
+                <!-- Saha Alanı (Sadece çıkış işleminde gösterilecek) -->
+                <div class="form-group" id="sahaGroup" style="display: none;">
+                    <label>Saha</label>
+                    <input type="text" id="modalSaha" placeholder="Stok çıkış yapılacak saha">
+                </div>
+                
+                <!-- Fiyat Gizleme (Sadece çıkış işleminde gösterilecek) -->
+                <div class="form-group" id="fiyatGizleGroup" style="display: none;">
+                    <label>
+                        <input type="checkbox" id="modalFiyatiGizle"> Fiyatı Gizle
+                    </label>
+                </div>
+                
+                <div class="form-group" id="musteriGroup" style="display: none;">
+                    <label>Müşteri</label>
+                    <select id="modalMusteriKodu">
+                        <!-- Müşteriler buraya eklenecek -->
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Açıklama</label>
+                    <textarea id="modalAciklama" rows="3"></textarea>
+                </div>
+                <button class="btn btn-primary" id="modalButton" onclick="stokIslemiYap()">Kaydet</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Fatura Modal -->
+    <div class="modal" id="faturaModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Fatura</h3>
+                <button class="close-modal" onclick="closeFaturaModal()">×</button>
+            </div>
+            <div class="modal-body">
+                <div id="faturaIcerik"></div>
+                <button class="btn btn-primary" onclick="printFatura()" style="margin-top: 20px;">Yazdır</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Fatura Detay Modal -->
+    <div class="modal" id="faturaDetayModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Fatura Detayı</h3>
+                <button class="close-modal" onclick="closeFaturaDetayModal()">×</button>
+            </div>
+            <div class="modal-body">
+                <div id="faturaDetayIcerik"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentPanel = 'dashboard';
+        let currentIslemTipi = '';
+        let currentUrunKodu = '';
+        
+        // Sayı formatlama fonksiyonu (binlik ayracı virgül, ondalık ayracı nokta)
+        function formatNumber(number) {
+            if (number === null || number === undefined) return '0,00';
+            const num = parseFloat(number);
+            if (isNaN(num)) return '0,00';
+            
+            // Ondalık kısmı 2 basamak, binlik ayracı virgül
+            return num.toFixed(2).replace(/\d(?=(\d{3})+\.)/g, '$&,').replace('.', ',');
+        }
+        
+        // Barkod arama fonksiyonu
+        function barkodAra() {
+            const barkod = document.getElementById('barkodArama').value.trim();
+            if (!barkod) {
+                showAlert('Lütfen bir barkod numarası girin!', 'error');
+                return;
+            }
+            
+            fetch(`/api/barkod_ara/${encodeURIComponent(barkod)}`)
+                .then(response => {
+                    if (response.status === 404) {
+                        return response.json().then(data => { 
+                            throw new Error(data.message || 'Barkod bulunamadı!'); 
+                        });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        // Barkod arama kutusunu temizle
+                        document.getElementById('barkodArama').value = '';
+                        
+                        // Ürün detay sayfasına git
+                        urunDetayGoster(data.urun_kodu);
+                        
+                        // Başarı mesajı göster
+                        showAlert(`"${data.urun.ad}" ürünü bulundu!`);
+                    } else {
+                        showAlert(data.message, 'error');
+                    }
+                })
+                .catch(error => {
+                    showAlert(error.message, 'error');
+                });
+        }
+        
+        // Barkod arama kutusuna Enter tuşu desteği
+        document.getElementById('barkodArama').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                barkodAra();
+            }
+        });
+        
+        // Barkod arama kutusuna otomatik odaklanma
+        document.addEventListener('DOMContentLoaded', function() {
+            // Stok işlemleri paneline geçildiğinde barkod arama kutusuna odaklan
+            const barkodAramaInput = document.getElementById('barkodArama');
+            if (barkodAramaInput) {
+                // Input'a her tıklamada içeriği seç (kolay silme için)
+                barkodAramaInput.addEventListener('click', function() {
+                    this.select();
+                });
+                
+                // Barkod okuyucular genellikle Enter ile biter, bu yüzden otomatik arama yap
+                let barkodBuffer = '';
+                let lastKeyTime = Date.now();
+                
+                barkodAramaInput.addEventListener('keydown', function(e) {
+                    const currentTime = Date.now();
+                    
+                    // Eğer 100ms'den fazla zaman geçmişse buffer'ı temizle
+                    if (currentTime - lastKeyTime > 100) {
+                        barkodBuffer = '';
+                    }
+                    
+                    lastKeyTime = currentTime;
+                    
+                    // Enter tuşuna basıldığında
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        if (barkodBuffer.length > 0) {
+                            barkodAra();
+                        }
+                    } else if (e.key.length === 1) {
+                        // Karakter tuşları buffer'a ekle
+                        barkodBuffer += e.key;
+                    }
+                });
+            }
+        });
+        
+        // Paneller arası geçiş
+        function showPanel(panelId) {
+            // Aktif tab'ı güncelle
+            document.querySelectorAll('.nav-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            
+            // Aktif paneli göster
+            document.querySelectorAll('.content-panel').forEach(panel => {
+                panel.classList.remove('active');
+            });
+            document.getElementById(panelId).classList.add('active');
+            
+            currentPanel = panelId;
+            
+            // Panel değiştiğinde verileri yenile
+            switch(panelId) {
+                case 'dashboard':
+                    loadDashboard();
+                    break;
+                case 'urunler':
+                    loadUrunler();
+                    break;
+                case 'musteriler':
+                    loadMusteriler();
+                    break;
+                case 'stok-islemleri':
+                    loadMevcutStoklar();
+                    // Stok işlemleri paneline geçildiğinde barkod arama kutusuna odaklan
+                    setTimeout(() => {
+                        const barkodInput = document.getElementById('barkodArama');
+                        if (barkodInput) {
+                            barkodInput.focus();
+                            barkodInput.select();
+                        }
+                    }, 100);
+                    break;
+                case 'faturalar':
+                    loadFaturalar();
+                    break;
+                case 'hareketler':
+                    loadHareketler();
+                    break;
+                case 'raporlar':
+                    loadRaporlar();
+                    break;
+            }
+        }
+        
+        // Çıkış yap
+        function logout() {
+            window.location.href = '/api/logout';
+        }
+        
+        // Alert göster
+        function showAlert(message, type = 'success') {
+            const alertDiv = type === 'success' ? 
+                document.getElementById('successAlert') : 
+                document.getElementById('errorAlert');
+            
+            alertDiv.textContent = message;
+            alertDiv.style.display = 'block';
+            
+            // 5 saniye sonra kaldır
+            setTimeout(() => {
+                alertDiv.style.display = 'none';
+            }, 5000);
+        }
+        
+        // Modal fonksiyonları
+        function showStokModal(tip) {
+            currentIslemTipi = tip;
+            const modal = document.getElementById('stokModal');
+            const title = document.getElementById('modalTitle');
+            const button = document.getElementById('modalButton');
+            const musteriGroup = document.getElementById('musteriGroup');
+            const iskontoGroup = document.getElementById('iskontoGroup');
+            const kdvGroup = document.getElementById('kdvGroup');
+            const sahaGroup = document.getElementById('sahaGroup');
+            const fiyatGizleGroup = document.getElementById('fiyatGizleGroup');
+            
+            switch(tip) {
+                case 'giris':
+                    title.textContent = 'Stok Girişi';
+                    button.textContent = 'Stok Girişi Yap';
+                    musteriGroup.style.display = 'none';
+                    iskontoGroup.style.display = 'none';
+                    kdvGroup.style.display = 'none';
+                    sahaGroup.style.display = 'none';
+                    fiyatGizleGroup.style.display = 'none';
+                    break;
+                case 'cikis':
+                    title.textContent = 'Stok Çıkışı';
+                    button.textContent = 'Stok Çıkışı Yap';
+                    musteriGroup.style.display = 'block';
+                    iskontoGroup.style.display = 'block';
+                    kdvGroup.style.display = 'block';
+                    sahaGroup.style.display = 'block';
+                    fiyatGizleGroup.style.display = 'block';
+                    break;
+                case 'iade':
+                    title.textContent = 'Stok İadesi';
+                    button.textContent = 'İade Al';
+                    musteriGroup.style.display = 'none';
+                    iskontoGroup.style.display = 'none';
+                    kdvGroup.style.display = 'none';
+                    sahaGroup.style.display = 'none';
+                    fiyatGizleGroup.style.display = 'none';
+                    break;
+            }
+            
+            // Ürün listesini doldur
+            fetch('/api/urunler')
+                .then(response => response.json())
+                .then(urunler => {
+                    const select = document.getElementById('modalUrunKodu');
+                    select.innerHTML = '<option value="">Ürün seçin</option>';
+                    Object.keys(urunler).forEach(kod => {
+                        const option = document.createElement('option');
+                        option.value = kod;
+                        option.textContent = `${kod} - ${urunler[kod].ad} (Stok: ${urunler[kod].stok})`;
+                        select.appendChild(option);
+                    });
+                });
+            
+            // Müşteri listesini doldur
+            fetch('/api/musteriler')
+                .then(response => response.json())
+                .then(musteriler => {
+                    const select = document.getElementById('modalMusteriKodu');
+                    select.innerHTML = '<option value="">Müşteri seçin</option>';
+                    Object.keys(musteriler).forEach(kod => {
+                        const option = document.createElement('option');
+                        option.value = kod;
+                        option.textContent = `${kod} - ${musteriler[kod].ad} (İskonto: ${musteriler[kod].iskonto_orani || 0}%)`;
+                        select.appendChild(option);
+                    });
+                });
+            
+            modal.style.display = 'flex';
+        }
+        
+        function closeModal() {
+            document.getElementById('stokModal').style.display = 'none';
+        }
+        
+        // Stok işlemi yap
+        function stokIslemiYap() {
+            const urunKodu = document.getElementById('modalUrunKodu').value;
+            const miktar = parseInt(document.getElementById('modalMiktar').value);
+            const aciklama = document.getElementById('modalAciklama').value;
+            const musteriKodu = document.getElementById('modalMusteriKodu').value;
+            const iskonto = parseFloat(document.getElementById('modalIskonto').value) || 0;
+            const kdv = parseFloat(document.getElementById('modalKdv').value) || 18;
+            const saha = document.getElementById('modalSaha').value;
+            const fiyatiGizle = document.getElementById('modalFiyatiGizle').checked;
+            
+            if (!urunKodu || !miktar) {
+                showAlert('Lütfen tüm zorunlu alanları doldurun!', 'error');
+                return;
+            }
+            
+            let url = '';
+            let data = {};
+            
+            switch(currentIslemTipi) {
+                case 'giris':
+                    url = '/api/stok_giris';
+                    data = { urun_kodu: urunKodu, miktar: miktar, aciklama: aciklama };
+                    break;
+                case 'cikis':
+                    url = '/api/stok_cikis';
+                    data = { 
+                        urun_kodu: urunKodu, 
+                        miktar: miktar, 
+                        aciklama: aciklama, 
+                        musteri_kodu: musteriKodu,
+                        iskonto_orani: iskonto,
+                        kdv_orani: kdv,
+                        saha: saha,
+                        fiyati_gizle: fiyatiGizle
+                    };
+                    break;
+                case 'iade':
+                    url = '/api/stok_iade';
+                    data = { urun_kodu: urunKodu, miktar: miktar, aciklama: aciklama };
+                    break;
+            }
+            
+            fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    showAlert(result.message);
+                    closeModal();
+                    loadDashboard();
+                    loadMevcutStoklar();
+                    
+                    // Eğer ürün detay panelindeysek, detayları yenile
+                    if (currentUrunKodu === urunKodu) {
+                        loadUrunDetay(currentUrunKodu);
+                    }
+                    
+                    // Eğer çıkış işleminde fatura oluşturulduysa göster
+                    if (result.fatura) {
+                        showFatura(result.fatura);
+                    }
+                } else {
+                    showAlert(result.message, 'error');
+                }
+            });
+        }
+        
+        // Ürün ekle
+        function urunEkle() {
+            const urun = {
+                kod: document.getElementById('urunKodu').value,
+                ad: document.getElementById('urunAdi').value,
+                kategori: document.getElementById('urunKategori').value,
+                birim: document.getElementById('urunBirim').value,
+                stok: parseInt(document.getElementById('urunStok').value),
+                fiyat: parseFloat(document.getElementById('urunFiyat').value),
+                kritik_stok: parseInt(document.getElementById('urunKritikStok').value),
+                barkod: document.getElementById('urunBarkod').value,
+                aciklama: document.getElementById('urunAciklama').value
+            };
+            
+            if (!urun.kod || !urun.ad) {
+                showAlert('Lütfen ürün kodu ve adını girin!', 'error');
+                return;
+            }
+            
+            fetch('/api/urun_ekle', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(urun)
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    showAlert(result.message);
+                    // Formu temizle
+                    document.getElementById('urunKodu').value = '';
+                    document.getElementById('urunAdi').value = '';
+                    document.getElementById('urunKategori').value = '';
+                    document.getElementById('urunStok').value = '0';
+                    document.getElementById('urunFiyat').value = '0';
+                    document.getElementById('urunKritikStok').value = '10';
+                    document.getElementById('urunBarkod').value = '';
+                    document.getElementById('urunAciklama').value = '';
+                    // Ürün listesini yenile
+                    loadUrunler();
+                    loadDashboard();
+                    loadMevcutStoklar();
+                } else {
+                    showAlert(result.message, 'error');
+                }
+            });
+        }
+        
+        // Müşteri ekle
+        function musteriEkle() {
+            const musteri = {
+                kod: document.getElementById('musteriKodu').value,
+                ad: document.getElementById('musteriAdi').value,
+                telefon: document.getElementById('musteriTelefon').value,
+                eposta: document.getElementById('musteriEposta').value,
+                vergi_no: document.getElementById('musteriVergiNo').value,
+                iskonto_orani: parseFloat(document.getElementById('musteriIskonto').value) || 0,
+                adres: document.getElementById('musteriAdres').value
+            };
+            
+            if (!musteri.ad) {
+                showAlert('Lütfen müşteri adını girin!', 'error');
+                return;
+            }
+            
+            fetch('/api/musteri_ekle', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(musteri)
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    showAlert(result.message);
+                    // Formu temizle
+                    document.getElementById('musteriKodu').value = '';
+                    document.getElementById('musteriAdi').value = '';
+                    document.getElementById('musteriTelefon').value = '';
+                    document.getElementById('musteriEposta').value = '';
+                    document.getElementById('musteriVergiNo').value = '';
+                    document.getElementById('musteriIskonto').value = '0';
+                    document.getElementById('musteriAdres').value = '';
+                    // Müşteri listesini yenile
+                    loadMusteriler();
+                    loadDashboard();
+                } else {
+                    showAlert(result.message, 'error');
+                }
+            });
+        }
+        
+        // Ürün sil
+        function urunSil(kod) {
+            if (confirm(`"${kod}" kodlu ürünü silmek istediğinize emin misiniz?`)) {
+                fetch('/api/urun_sil', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ urun_kodu: kod })
+                })
+                .then(response => response.json())
+                .then(result => {
+                    if (result.success) {
+                        showAlert(result.message);
+                        loadUrunler();
+                        loadDashboard();
+                        loadMevcutStoklar();
+                    } else {
+                        showAlert(result.message, 'error');
+                    }
+                });
+            }
+        }
+        
+        // Müşteri sil
+        function musteriSil(kod) {
+            if (confirm(`"${kod}" kodlu müşteriyi silmek istediğinize emin misiniz?`)) {
+                fetch('/api/musteri_sil', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ musteri_kodu: kod })
+                })
+                .then(response => response.json())
+                .then(result => {
+                    if (result.success) {
+                        showAlert(result.message);
+                        loadMusteriler();
+                        loadDashboard();
+                    } else {
+                        showAlert(result.message, 'error');
+                    }
+                });
+            }
+        }
+        
+        // Dashboard verilerini yükle
+        function loadDashboard() {
+            fetch('/api/rapor')
+                .then(response => response.json())
+                .then(rapor => {
+                    document.getElementById('toplamUrun').textContent = rapor.toplam_urun;
+                    document.getElementById('toplamStok').textContent = rapor.toplam_stok;
+                    document.getElementById('toplamDeger').textContent = formatNumber(rapor.toplam_deger) + ' TL';
+                    document.getElementById('toplamMusteri').textContent = rapor.toplam_musteri;
+                });
+            
+            // Son hareketleri yükle
+            fetch('/api/hareketler')
+                .then(response => response.json())
+                .then(hareketler => {
+                    const tbody = document.querySelector('#sonHareketlerTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    // Son 5 hareketi göster
+                    hareketler.slice(-5).reverse().forEach(hareket => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${hareket.tarih}</td>
+                            <td>${hareket.urun_kodu}</td>
+                            <td>
+                                <span class="badge ${hareket.tip === 'GIRIS' ? 'badge-success' : 
+                                                 hareket.tip === 'CIKIS' ? 'badge-danger' : 
+                                                 'badge-warning'}">
+                                    ${hareket.tip === 'GIRIS' ? 'Giriş' : 
+                                     hareket.tip === 'CIKIS' ? 'Çıkış' : 
+                                     hareket.tip === 'IADE' ? 'İade' : 'İlk Stok'}
+                                </span>
+                            </td>
+                            <td>${hareket.miktar}</td>
+                            <td>${hareket.mevcut_stok}</td>
+                            <td>${hareket.saha || '-'}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+        
+        // Ürün listesini yükle
+        function loadUrunler() {
+            fetch('/api/urunler')
+                .then(response => response.json())
+                .then(urunler => {
+                    const tbody = document.querySelector('#urunlerTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    Object.keys(urunler).forEach(kod => {
+                        const urun = urunler[kod];
+                        const stokDurumu = urun.stok < urun.kritik_stok ? 'badge-warning' : 'badge-success';
+                        const stokDurumuText = urun.stok < urun.kritik_stok ? 'Kritik' : 'Normal';
+                        
+                        tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${kod}</td>
+                            <td>${urun.ad}</td>
+                            <td>${urun.kategori}</td>
+                            <td>
+                                <span class="badge ${stokDurumu}">
+                                    ${urun.stok} ${urun.birim}
+                                </span>
+                                ${stokDurumuText === 'Kritik' ? ' ⚠️' : ''}
+                            </td>
+                            <td>${formatNumber(urun.fiyat)} TL</td>
+                            <td>${urun.birim}</td>
+                            <td>${urun.barkod || '-'}</td>
+                            <td>
+                                <button class="btn btn-sm btn-danger" onclick="urunSil('${kod}')">Sil</button>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+        
+        // Müşteri listesini yükle
+        function loadMusteriler() {
+            fetch('/api/musteriler')
+                .then(response => response.json())
+                .then(musteriler => {
+                    const tbody = document.querySelector('#musterilerTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    Object.keys(musteriler).forEach(kod => {
+                        const musteri = musteriler[kod];
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${kod}</td>
+                            <td>${musteri.ad}</td>
+                            <td>${musteri.telefon}</td>
+                            <td>${musteri.eposta}</td>
+                            <td>${musteri.iskonto_orani || 0}%</td>
+                            <td>
+                                <button class="btn btn-sm btn-danger" onclick="musteriSil('${kod}')">Sil</button>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+        
+        // Mevcut stokları yükle
+        function loadMevcutStoklar() {
+            fetch('/api/urunler')
+                .then(response => response.json())
+                .then(urunler => {
+                    const tbody = document.querySelector('#mevcutStoklarTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    Object.keys(urunler).forEach(kod => {
+                        const urun = urunler[kod];
+                        const stokDegeri = urun.stok * urun.fiyat;
+                        const stokDurumu = urun.stok < urun.kritik_stok ? 'badge-warning' : 'badge-success';
+                        const stokDurumuText = urun.stok < urun.kritik_stok ? 'Kritik' : 'Normal';
+                        
+                        const tr = document.createElement('tr');
+                        tr.className = 'urun-row';
+                        tr.innerHTML = `
+                            <td><strong>${kod}</strong></td>
+                            <td>${urun.ad}</td>
+                            <td>${urun.kategori}</td>
+                            <td>
+                                <span class="badge ${stokDurumu}">
+                                    ${stokDurumuText}
+                                </span>
+                            </td>
+                            <td>${urun.stok} ${urun.birim}</td>
+                            <td>${formatNumber(urun.fiyat)} TL</td>
+                            <td>${formatNumber(stokDegeri)} TL</td>
+                            <td>${urun.barkod || '-'}</td>
+                        `;
+                        
+                        // Ürüne tıklanınca detay sayfasına git
+                        tr.addEventListener('click', function() {
+                            urunDetayGoster(kod);
+                        });
+                        
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+        
+        // Ürün detayını göster
+        function urunDetayGoster(urunKodu) {
+            currentUrunKodu = urunKodu;
+            
+            // Panel değiştir
+            document.getElementById('stokAnaPanel').style.display = 'none';
+            document.getElementById('urunDetayPanel').style.display = 'block';
+            
+            // Ürün detayını yükle
+            loadUrunDetay(urunKodu);
+        }
+        
+        // Geri dön
+        function geriDon() {
+            document.getElementById('urunDetayPanel').style.display = 'none';
+            document.getElementById('stokAnaPanel').style.display = 'block';
+            currentUrunKodu = '';
+            
+            // Barkod arama kutusuna odaklan
+            setTimeout(() => {
+                const barkodInput = document.getElementById('barkodArama');
+                if (barkodInput) {
+                    barkodInput.focus();
+                    barkodInput.select();
+                }
+            }, 100);
+        }
+        
+        // Ürün detayını yükle
+        function loadUrunDetay(urunKodu) {
+            // Ürün bilgilerini yükle
+            fetch(`/api/urun/${urunKodu}`)
+                .then(response => response.json())
+                .then(urun => {
+                    document.getElementById('detayUrunAdi').textContent = urun.ad;
+                    document.getElementById('detayUrunKodu').textContent = `Kod: ${urunKodu} | Kategori: ${urun.kategori} | Barkod: ${urun.barkod || 'Yok'}`;
+                    document.getElementById('detayMevcutStok').textContent = `${urun.stok} ${urun.birim}`;
+                    document.getElementById('detayBirimFiyat').textContent = `${formatNumber(urun.fiyat)} TL`;
+                    document.getElementById('detayStokDegeri').textContent = `${formatNumber(urun.stok * urun.fiyat)} TL`;
+                    document.getElementById('detayKritikStok').textContent = urun.kritik_stok || 10;
+                });
+            
+            // Ürün hareketlerini yükle
+            fetch(`/api/urun/${urunKodu}/hareketler`)
+                .then(response => response.json())
+                .then(hareketler => {
+                    const tbody = document.querySelector('#urunDetayHareketlerTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    hareketler.reverse().forEach(hareket => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${hareket.tarih}</td>
+                            <td>
+                                <span class="badge ${hareket.tip === 'GIRIS' ? 'badge-success' : 
+                                                 hareket.tip === 'CIKIS' ? 'badge-danger' : 
+                                                 'badge-warning'}">
+                                    ${hareket.tip === 'GIRIS' ? 'Giriş' : 
+                                     hareket.tip === 'CIKIS' ? 'Çıkış' : 
+                                     hareket.tip === 'IADE' ? 'İade' : 'İlk Stok'}
+                                </span>
+                            </td>
+                            <td>${hareket.miktar}</td>
+                            <td>${hareket.mevcut_stok}</td>
+                            <td>${hareket.aciklama || ''}</td>
+                            <td>${hareket.musteri_kodu || ''}</td>
+                            <td>${hareket.saha || ''}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+        
+        // Ürün detayında işlem yap
+        function urunDetayIslem(tip) {
+            currentIslemTipi = tip;
+            const modal = document.getElementById('stokModal');
+            const title = document.getElementById('modalTitle');
+            const button = document.getElementById('modalButton');
+            const musteriGroup = document.getElementById('musteriGroup');
+            const iskontoGroup = document.getElementById('iskontoGroup');
+            const kdvGroup = document.getElementById('kdvGroup');
+            const sahaGroup = document.getElementById('sahaGroup');
+            const fiyatGizleGroup = document.getElementById('fiyatGizleGroup');
+            
+            switch(tip) {
+                case 'giris':
+                    title.textContent = 'Stok Girişi';
+                    button.textContent = 'Stok Girişi Yap';
+                    musteriGroup.style.display = 'none';
+                    iskontoGroup.style.display = 'none';
+                    kdvGroup.style.display = 'none';
+                    sahaGroup.style.display = 'none';
+                    fiyatGizleGroup.style.display = 'none';
+                    break;
+                case 'cikis':
+                    title.textContent = 'Stok Çıkışı';
+                    button.textContent = 'Stok Çıkışı Yap';
+                    musteriGroup.style.display = 'block';
+                    iskontoGroup.style.display = 'block';
+                    kdvGroup.style.display = 'block';
+                    sahaGroup.style.display = 'block';
+                    fiyatGizleGroup.style.display = 'block';
+                    break;
+                case 'iade':
+                    title.textContent = 'Stok İadesi';
+                    button.textContent = 'İade Al';
+                    musteriGroup.style.display = 'none';
+                    iskontoGroup.style.display = 'none';
+                    kdvGroup.style.display = 'none';
+                    sahaGroup.style.display = 'none';
+                    fiyatGizleGroup.style.display = 'none';
+                    break;
+            }
+            
+            // Ürün kodunu otomatik doldur
+            const urunSelect = document.getElementById('modalUrunKodu');
+            urunSelect.innerHTML = '';
+            const option = document.createElement('option');
+            option.value = currentUrunKodu;
+            option.textContent = `${currentUrunKodu} - (Seçili Ürün)`;
+            option.selected = true;
+            urunSelect.appendChild(option);
+            
+            // Müşteri listesini doldur
+            fetch('/api/musteriler')
+                .then(response => response.json())
+                .then(musteriler => {
+                    const select = document.getElementById('modalMusteriKodu');
+                    select.innerHTML = '<option value="">Müşteri seçin</option>';
+                    Object.keys(musteriler).forEach(kod => {
+                        const option = document.createElement('option');
+                        option.value = kod;
+                        option.textContent = `${kod} - ${musteriler[kod].ad}`;
+                        select.appendChild(option);
+                    });
+                });
+            
+            modal.style.display = 'flex';
+        }
+        
+        // Faturaları yükle
+        function loadFaturalar() {
+            fetch('/api/faturalar')
+                .then(response => response.json())
+                .then(faturalar => {
+                    console.log('Faturalar:', faturalar); // Debug için
+                    const tbody = document.querySelector('#faturalarTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    if (faturalar.length === 0) {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td colspan="9" style="text-align: center; padding: 20px;">
+                                Henüz fatura kesilmemiş.
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                        return;
+                    }
+                    
+                    faturalar.forEach(fatura => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${fatura.fatura_no}</td>
+                            <td>${fatura.tarih}</td>
+                            <td>${fatura.musteri_adi}</td>
+                            <td>${fatura.urun_adi}</td>
+                            <td>${fatura.miktar}</td>
+                            <td>${formatNumber(fatura.genel_toplam)} TL</td>
+                            <td>${fatura.saha || '-'}</td>
+                            <td>${fatura.fiyati_gizle ? 'Evet' : 'Hayır'}</td>
+                            <td>
+                                <button class="btn btn-sm btn-primary" onclick="faturaDetayGoster('${fatura.fatura_no}')">Detay</button>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                })
+                .catch(error => {
+                    console.error('Faturalar yüklenirken hata:', error);
+                    showAlert('Faturalar yüklenirken bir hata oluştu!', 'error');
+                });
+        }
+        
+        // Fatura detayını göster
+        function faturaDetayGoster(faturaNo) {
+            fetch(`/api/fatura/${faturaNo}`)
+                .then(response => response.json())
+                .then(fatura => {
+                    const modal = document.getElementById('faturaDetayModal');
+                    const icerik = document.getElementById('faturaDetayIcerik');
+                    
+                    // Fiyat gizleme seçeneğine göre fiyat sütunlarını ayarla
+                    let birimFiyatGoster = '';
+                    let toplamTutarGoster = '';
+                    let iskontoTutariGoster = '';
+                    let kdvTutariGoster = '';
+                    let genelToplamGoster = '';
+                    
+                    if (fatura.fiyati_gizle) {
+                        birimFiyatGoster = '***';
+                        toplamTutarGoster = '***';
+                        iskontoTutariGoster = '***';
+                        kdvTutariGoster = '***';
+                        genelToplamGoster = '***';
+                    } else {
+                        birimFiyatGoster = formatNumber(fatura.birim_fiyat) + ' TL';
+                        toplamTutarGoster = formatNumber(fatura.toplam_tutar) + ' TL';
+                        iskontoTutariGoster = formatNumber(fatura.iskonto_tutari) + ' TL';
+                        kdvTutariGoster = formatNumber(fatura.kdv_tutari) + ' TL';
+                        genelToplamGoster = formatNumber(fatura.genel_toplam) + ' TL';
+                    }
+                    
+                    icerik.innerHTML = `
+                        <div style="border: 2px solid #333; padding: 20px; border-radius: 10px;">
+                            <h3 style="text-align: center; color: #333;">FATURA DETAYI</h3>
+                            <hr style="margin: 15px 0;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                                <div>
+                                    <strong>Fatura No:</strong> ${fatura.fatura_no}<br>
+                                    <strong>Tarih:</strong> ${fatura.tarih}<br>
+                                    <strong>Saha:</strong> ${fatura.saha || 'Belirtilmemiş'}
+                                </div>
+                                <div style="text-align: right;">
+                                    <strong>Müşteri:</strong> ${fatura.musteri_adi}<br>
+                                    <strong>Müşteri Kodu:</strong> ${fatura.musteri_kodu}
+                                </div>
+                            </div>
+                            <hr style="margin: 15px 0;">
+                            <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px;">
+                                <thead>
+                                    <tr style="background-color: #f0f0f0;">
+                                        <th style="padding: 10px; text-align: left;">Ürün Kodu</th>
+                                        <th style="padding: 10px; text-align: left;">Ürün Adı</th>
+                                        <th style="padding: 10px; text-align: right;">Miktar</th>
+                                        <th style="padding: 10px; text-align: right;">Birim Fiyat</th>
+                                        <th style="padding: 10px; text-align: right;">Toplam</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td style="padding: 10px;">${fatura.urun_kodu}</td>
+                                        <td style="padding: 10px;">${fatura.urun_adi}</td>
+                                        <td style="padding: 10px; text-align: right;">${fatura.miktar}</td>
+                                        <td style="padding: 10px; text-align: right;">${birimFiyatGoster}</td>
+                                        <td style="padding: 10px; text-align: right;">${toplamTutarGoster}</td>
+                                    </tr>
+                                </tbody>
+                                <tfoot>
+                                    <tr>
+                                        <td colspan="4" style="padding: 10px; text-align: right;"><strong>Toplam Tutar:</strong></td>
+                                        <td style="padding: 10px; text-align: right;">${toplamTutarGoster}</td>
+                                    </tr>
+                                    <tr>
+                                        <td colspan="4" style="padding: 10px; text-align: right;"><strong>İskonto (${fatura.iskonto_orani}%):</strong></td>
+                                        <td style="padding: 10px; text-align: right;">-${iskontoTutariGoster}</td>
+                                    </tr>
+                                    <tr>
+                                        <td colspan="4" style="padding: 10px; text-align: right;"><strong>KDV Öncesi Tutar:</strong></td>
+                                        <td style="padding: 10px; text-align: right;">${formatNumber(fatura.toplam_tutar - fatura.iskonto_tutari)} TL</td>
+                                    </tr>
+                                    <tr>
+                                        <td colspan="4" style="padding: 10px; text-align: right;"><strong>KDV (${fatura.kdv_orani}%):</strong></td>
+                                        <td style="padding: 10px; text-align: right;">${kdvTutariGoster}</td>
+                                    </tr>
+                                    <tr style="background-color: #f0f0f0;">
+                                        <td colspan="4" style="padding: 10px; text-align: right;"><strong>GENEL TOPLAM:</strong></td>
+                                        <td style="padding: 10px; text-align: right; font-weight: bold;">${genelToplamGoster}</td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                            <hr style="margin: 15px 0;">
+                            <p><strong>Açıklama:</strong> ${fatura.aciklama || ''}</p>
+                            <p><strong>Fiyat Gizlendi mi?:</strong> ${fatura.fiyati_gizle ? 'Evet' : 'Hayır'}</p>
+                        </div>
+                    `;
+                    
+                    modal.style.display = 'flex';
+                })
+                .catch(error => {
+                    console.error('Fatura detayı yüklenirken hata:', error);
+                    showAlert('Fatura detayı yüklenirken bir hata oluştu!', 'error');
+                });
+        }
+        
+        function closeFaturaDetayModal() {
+            document.getElementById('faturaDetayModal').style.display = 'none';
+        }
+        
+        // Hareketleri yükle
+        function loadHareketler() {
+            fetch('/api/hareketler')
+                .then(response => response.json())
+                .then(hareketler => {
+                    const tbody = document.querySelector('#hareketlerTable tbody');
+                    tbody.innerHTML = '';
+                    
+                    hareketler.reverse().forEach(hareket => {
+                        const tr = document.createElement('tr');
+                        const iskontoHtml = hareket.iskonto_orani > 0 ? 
+                            `<br><small>İskonto: ${hareket.iskonto_orani}%</small>` : '';
+                        const kdvHtml = hareket.kdv_orani > 0 ? 
+                            `<br><small>KDV: ${hareket.kdv_orani || 0}%</small>` : '';
+                        
+                        tr.innerHTML = `
+                            <td>${hareket.tarih}</td>
+                            <td>${hareket.id}</td>
+                            <td>${hareket.urun_kodu}</td>
+                            <td>
+                                <span class="badge ${hareket.tip === 'GIRIS' ? 'badge-success' : 
+                                                 hareket.tip === 'CIKIS' ? 'badge-danger' : 
+                                                 'badge-warning'}">
+                                    ${hareket.tip === 'GIRIS' ? 'Giriş' : 
+                                     hareket.tip === 'CIKIS' ? 'Çıkış' : 
+                                     hareket.tip === 'IADE' ? 'İade' : 'İlk Stok'}
+                                </span>
+                                ${iskontoHtml}
+                                ${kdvHtml}
+                            </td>
+                            <td>${hareket.miktar}</td>
+                            <td>${hareket.mevcut_stok}</td>
+                            <td>${hareket.aciklama || ''}</td>
+                            <td>${hareket.musteri_kodu || ''}</td>
+                            <td>${hareket.saha || ''}</td>
+                            <td>${hareket.fatura_no || ''}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                });
+        }
+        
+        // Raporları yükle
+        function loadRaporlar() {
+            fetch('/api/urunler')
+                .then(response => response.json())
+                .then(urunler => {
+                    let azStoklu = 0;
+                    Object.values(urunler).forEach(urun => {
+                        const kritikStok = urun.kritik_stok || 10;
+                        if (urun.stok < kritikStok) azStoklu++;
+                    });
+                    document.getElementById('azStokluUrun').textContent = azStoklu;
+                    
+                    // Ürün listesini fatura için doldur
+                    const select = document.getElementById('faturaUrun');
+                    select.innerHTML = '<option value="">Ürün seçin</option>';
+                    Object.keys(urunler).forEach(kod => {
+                        const option = document.createElement('option');
+                        option.value = kod;
+                        option.textContent = `${kod} - ${urunler[kod].ad} (Stok: ${urunler[kod].stok})`;
+                        select.appendChild(option);
+                    });
+                });
+            
+            fetch('/api/musteriler')
+                .then(response => response.json())
+                .then(musteriler => {
+                    const select = document.getElementById('faturaMusteri');
+                    select.innerHTML = '<option value="">Müşteri seçin</option>';
+                    Object.keys(musteriler).forEach(kod => {
+                        const option = document.createElement('option');
+                        option.value = kod;
+                        option.textContent = `${kod} - ${musteriler[kod].ad} (İskonto: ${musteriler[kod].iskonto_orani || 0}%)`;
+                        select.appendChild(option);
+                    });
+                });
+            
+            fetch('/api/hareketler')
+                .then(response => response.json())
+                .then(hareketler => {
+                    let toplamGiris = 0;
+                    let toplamCikis = 0;
+                    let toplamIade = 0;
+                    
+                    hareketler.forEach(hareket => {
+                        if (hareket.tip === 'GIRIS') toplamGiris += hareket.miktar;
+                        else if (hareket.tip === 'CIKIS') toplamCikis += hareket.miktar;
+                        else if (hareket.tip === 'IADE') toplamIade += hareket.miktar;
+                    });
+                    
+                    document.getElementById('toplamGiris').textContent = toplamGiris;
+                    document.getElementById('toplamCikis').textContent = toplamCikis;
+                    document.getElementById('toplamIade').textContent = toplamIade;
+                });
+        }
+        
+        // Fatura oluştur
+        function faturaOlustur() {
+            const urunKodu = document.getElementById('faturaUrun').value;
+            const musteriKodu = document.getElementById('faturaMusteri').value;
+            const miktar = parseInt(document.getElementById('faturaMiktar').value);
+            const iskonto = parseFloat(document.getElementById('faturaIskonto').value) || 0;
+            const kdv = parseFloat(document.getElementById('faturaKdv').value) || 18;
+            const saha = document.getElementById('faturaSaha').value;
+            const fiyatiGizle = document.getElementById('faturaFiyatiGizle').checked;
+            const aciklama = document.getElementById('faturaAciklama').value;
+            
+            if (!urunKodu || !musteriKodu || !miktar) {
+                showAlert('Lütfen tüm alanları doldurun!', 'error');
+                return;
+            }
+            
+            fetch('/api/stok_cikis', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    urun_kodu: urunKodu,
+                    miktar: miktar,
+                    musteri_kodu: musteriKodu,
+                    iskonto_orani: iskonto,
+                    kdv_orani: kdv,
+                    saha: saha,
+                    fiyati_gizle: fiyatiGizle,
+                    aciklama: aciklama
+                })
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    showAlert('Fatura oluşturuldu!');
+                    showFatura(result.fatura);
+                    loadDashboard();
+                    loadMevcutStoklar();
+                    loadFaturalar();
+                } else {
+                    showAlert(result.message, 'error');
+                }
+            });
+        }
+        
+        // Fatura göster
+        function showFatura(fatura) {
+            const modal = document.getElementById('faturaModal');
+            const icerik = document.getElementById('faturaIcerik');
+            
+            // Fiyat gizleme seçeneğine göre fiyat sütunlarını ayarla
+            let birimFiyatGoster = '';
+            let toplamTutarGoster = '';
+            let iskontoTutariGoster = '';
+            let kdvTutariGoster = '';
+            let genelToplamGoster = '';
+            
+            if (fatura.fiyati_gizle) {
+                birimFiyatGoster = '***';
+                toplamTutarGoster = '***';
+                iskontoTutariGoster = '***';
+                kdvTutariGoster = '***';
+                genelToplamGoster = '***';
+            } else {
+                birimFiyatGoster = formatNumber(fatura.birim_fiyat) + ' TL';
+                toplamTutarGoster = formatNumber(fatura.toplam_tutar) + ' TL';
+                iskontoTutariGoster = formatNumber(fatura.iskonto_tutari) + ' TL';
+                kdvTutariGoster = formatNumber(fatura.kdv_tutari) + ' TL';
+                genelToplamGoster = formatNumber(fatura.genel_toplam) + ' TL';
+            }
+            
+            icerik.innerHTML = `
+                <div style="border: 2px solid #333; padding: 20px; border-radius: 10px;">
+                    <h3 style="text-align: center; color: #333;">FATURA</h3>
+                    <hr style="margin: 15px 0;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                        <div>
+                            <strong>Fatura No:</strong> ${fatura.fatura_no}<br>
+                            <strong>Tarih:</strong> ${fatura.tarih}<br>
+                            <strong>Saha:</strong> ${fatura.saha || 'Belirtilmemiş'}
+                        </div>
+                        <div style="text-align: right;">
+                            <strong>Müşteri:</strong> ${fatura.musteri_adi}<br>
+                            <strong>Müşteri Kodu:</strong> ${fatura.musteri_kodu}
+                        </div>
+                    </div>
+                    <hr style="margin: 15px 0;">
+                    <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px;">
+                        <thead>
+                            <tr style="background-color: #f0f0f0;">
+                                <th style="padding: 10px; text-align: left;">Ürün Kodu</th>
+                                <th style="padding: 10px; text-align: left;">Ürün Adı</th>
+                                <th style="padding: 10px; text-align: right;">Miktar</th>
+                                <th style="padding: 10px; text-align: right;">Birim Fiyat</th>
+                                <th style="padding: 10px; text-align: right;">Toplam</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="padding: 10px;">${fatura.urun_kodu}</td>
+                                <td style="padding: 10px;">${fatura.urun_adi}</td>
+                                <td style="padding: 10px; text-align: right;">${fatura.miktar}</td>
+                                <td style="padding: 10px; text-align: right;">${birimFiyatGoster}</td>
+                                <td style="padding: 10px; text-align: right;">${toplamTutarGoster}</td>
+                            </tr>
+                        </tbody>
+                        <tfoot>
+                            <tr>
+                                <td colspan="4" style="padding: 10px; text-align: right;"><strong>Toplam Tutar:</strong></td>
+                                <td style="padding: 10px; text-align: right;">${toplamTutarGoster}</td>
+                            </tr>
+                            <tr>
+                                <td colspan="4" style="padding: 10px; text-align: right;"><strong>İskonto (${fatura.iskonto_orani}%):</strong></td>
+                                <td style="padding: 10px; text-align: right;">-${iskontoTutariGoster}</td>
+                            </tr>
+                            <tr>
+                                <td colspan="4" style="padding: 10px; text-align: right;"><strong>KDV Öncesi Tutar:</strong></td>
+                                <td style="padding: 10px; text-align: right;">${formatNumber(fatura.toplam_tutar - fatura.iskonto_tutari)} TL</td>
+                            </tr>
+                            <tr>
+                                <td colspan="4" style="padding: 10px; text-align: right;"><strong>KDV (${fatura.kdv_orani}%):</strong></td>
+                                <td style="padding: 10px; text-align: right;">${kdvTutariGoster}</td>
+                            </tr>
+                            <tr style="background-color: #f0f0f0;">
+                                <td colspan="4" style="padding: 10px; text-align: right;"><strong>GENEL TOPLAM:</strong></td>
+                                <td style="padding: 10px; text-align: right; font-weight: bold;">${genelToplamGoster}</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                    <hr style="margin: 15px 0;">
+                    <p><strong>Açıklama:</strong> ${fatura.aciklama || ''}</p>
+                    <p><strong>Fiyat Gizlendi mi?:</strong> ${fatura.fiyati_gizle ? 'Evet' : 'Hayır'}</p>
+                    <div style="margin-top: 30px; text-align: center;">
+                        <p>*** Fatura Sonu ***</p>
+                    </div>
+                </div>
+            `;
+            
+            modal.style.display = 'flex';
+        }
+        
+        function closeFaturaModal() {
+            document.getElementById('faturaModal').style.display = 'none';
+        }
+        
+        function printFatura() {
+            const printContent = document.getElementById('faturaIcerik').innerHTML;
+            const originalContent = document.body.innerHTML;
+            
+            document.body.innerHTML = printContent;
+            window.print();
+            document.body.innerHTML = originalContent;
+            location.reload();
+        }
+        
+        // Sayfa yüklendiğinde dashboard'u yükle
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+        });
+    </script>
+</body>
+</html>"""
+    
+    # HTML dosyalarını oluştur
+    with open('login.html', 'w', encoding='utf-8') as f:
+        f.write(login_html)
+    
+    with open('stok.html', 'w', encoding='utf-8') as f:
+        f.write(stok_html)
+
+def main():
+    port = 8080
+    
+    # HTML dosyalarını oluştur
+    create_html_files()
+    
+    # Veri dosyasını kontrol et (yoksa oluştur)
+    if not os.path.exists('stok_data.json'):
+        with open('stok_data.json', 'w', encoding='utf-8') as f:
+            json.dump({'urunler': {}, 'musteriler': {}, 'hareketler': [], 'faturalar': []}, f, ensure_ascii=False, indent=2)
+    
+    server_address = ('0.0.0.0', port)
+    httpd = HTTPServer(server_address, StokHandler)
+    
+    ip = get_ip_address()
+    
+    print("\n" + "="*60)
+    print("🚀 TAMERSOFT STOK TAKİP SİSTEMİ BAŞLATILDI")
+    print("="*60)
+    print(f"📍 Yerel IP: http://{ip}:{port}")
+    print(f"📍 Localhost: http://localhost:{port}")
+    print("\n🔐 GİRİŞ BİLGİLERİ:")
+    print(f"   Şifre: {StokHandler.LOGIN_PASSWORD}")
+    print("\n🤖 TELEGRAM BİLDİRİMLERİ:")
+    print(f"   Bot Token: {StokHandler.TELEGRAM_BOT_TOKEN[:10]}...")
+    print(f"   Chat ID: {StokHandler.TELEGRAM_CHAT_ID}")
+    print("   Her stok işleminde Telegram'a bildirim gönderilecek")
+    print("\n📱 AYNI AĞDAKİ DİĞER CİHAZLARDAN BAĞLANMAK İÇİN:")
+    print(f"   Tarayıcıya şu adresi yazın: http://{ip}:{port}")
+    print("\n✨ YENİ ÖZELLİKLER:")
+    print("   ✓ Stok çıkışına 'SAHA' parametresi eklendi")
+    print("   ✓ Fatura kesiminde 'Fiyatı Gizle' seçeneği eklendi")
+    print("   ✓ Faturalar sekmesi eklendi - tüm faturalar listeleniyor")
+    print("   ✓ Fatura detay görüntüleme özelliği eklendi")
+    print("   ✓ Login sayfasındaki varsayılan şifre yazısı kaldırıldı")
+    print("\n🔧 DÜZELTİLMİŞ SORUNLAR:")
+    print("   ✓ Fatura listesi artık düzgün görünüyor")
+    print("   ✓ Fiyat gizleme özelliği düzeltildi - artık çalışıyor")
+    print("\n📋 MEVCUT ÖZELLİKLER:")
+    print("   ✓ Şifre korumalı giriş")
+    print("   ✓ Ürün ve müşteri yönetimi")
+    print("   ✓ Stok giriş/çıkış/iade işlemleri")
+    print("   ✓ Fatura sistemi (iskontolu ve KDV'li)")
+    print("   ✓ Ürün detay sayfası")
+    print("   ✓ Raporlama sistemi")
+    print("   ✓ Barkod ile hızlı stok arama")
+    print("   ✓ Telegram bildirimleri")
+    print("\n⚠️  NOT: Sadece aynı WiFi/yerel ağdaki cihazlar bağlanabilir")
+    print("\n🛑 Durdurmak için: CTRL + C")
+    print("="*60)
+    
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\n👋 Sunucu durduruldu")
+        httpd.server_close()
+
+if __name__ == '__main__':
+    main()
